@@ -108,6 +108,13 @@ class LockBusy(RuntimeError):
     pass
 
 
+class LockTimeout(RuntimeError):
+    """SQLite 在 30 秒 busy_timeout 内仍拿不到写锁。
+
+    语义：本次建批**没有登记任何批次**，调用方应返回可重试的 503。
+    """
+
+
 def acquire_lock(conn: sqlite3.Connection, batch_id: int) -> str:
     worker_id = uuid.uuid4().hex
     try:
@@ -163,6 +170,42 @@ def create_batch(conn: sqlite3.Connection, filename: str) -> int:
     )
     conn.commit()
     return cur.lastrowid
+
+
+def create_batch_with_rows(
+    conn: sqlite3.Connection,
+    filename: str,
+    csv_rows: list,
+) -> int:
+    """在**单个事务**里登记批次与全部行；任何一步失败整体回滚。
+
+    遇写锁时由 SQLite 的 30 秒 busy_timeout 兜底忙等；超时抛
+    :class:`LockTimeout`，调用方据此返回可重试 503，且本函数保证
+    数据库里不会留下批次/行记录（要么全部提交，要么全部回滚）。
+    """
+    ts = now()
+    try:
+        cur = conn.execute(
+            "INSERT INTO batches(filename, status, created_at, updated_at) "
+            "VALUES(?,?,?,?)",
+            (filename, BATCH_STOPPED, ts, ts),
+        )
+        batch_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO rows(batch_id, seq, sample_no, project, result, "
+            "status, updated_at) VALUES(?,?,?,?,?,?,?)",
+            [(batch_id, r.seq, r.sample_no, r.project, r.result, PENDING, ts)
+             for r in csv_rows],
+        )
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        # "database is locked" / "database table is locked"：30 秒忙等已超时
+        conn.rollback()
+        raise LockTimeout(f"建批等待写锁超时（30 秒），请稍后重试：{exc}") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    return batch_id
 
 
 def add_row(

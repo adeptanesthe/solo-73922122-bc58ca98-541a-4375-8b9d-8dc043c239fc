@@ -16,6 +16,9 @@ export LEGACY_URL="http://127.0.0.1:${LEGACY_PORT}"
 export HEADLESS="${HEADLESS:-1}"
 export BROWSER_CHANNEL="${BROWSER_CHANNEL:-chromium}"   # 本机只有完整 Chromium
 export SLOW_MO_MS="${SLOW_MO_MS:-150}"
+# 上传建批有界容量：4 执行名额（专用线程池同尺寸）+ 16 排队名额，满额 503
+export UPLOAD_MAX_ACTIVE="${UPLOAD_MAX_ACTIVE:-4}"
+export UPLOAD_MAX_QUEUED="${UPLOAD_MAX_QUEUED:-16}"
 
 # 本机 Chromium 依赖库解压在用户目录时，需要补 LD_LIBRARY_PATH
 if [ -d "$HOME/.local/chromelibs" ]; then

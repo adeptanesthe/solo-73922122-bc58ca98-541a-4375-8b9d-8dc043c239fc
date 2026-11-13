@@ -36,6 +36,10 @@ services:
       LEGACY_URL: http://legacy:8000
       HEADLESS: "1"
       SLOW_MO_MS: "150"      # 放慢动作便于人工观察浏览器填表
+      # 上传建批的有界容量：4 个执行名额（专用线程池同尺寸）+ 16 个排队名额，
+      # 总容量 20，满额返回可重试 503；SQLite 写锁仍保留原 30 秒 busy_timeout。
+      UPLOAD_MAX_ACTIVE: "4"
+      UPLOAD_MAX_QUEUED: "16"
     ports:
       - "8000:8000"          # 报送控制台：http://localhost:8000
     volumes:

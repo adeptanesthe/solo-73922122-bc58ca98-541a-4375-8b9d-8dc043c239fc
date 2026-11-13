@@ -7,6 +7,9 @@ data/*.log
 data/*.pid
 data/uploads/*
 data/screenshots/*
+data/_concurrency_tmp/
+data/_e2e/
+data/t-*.csv
 !data/uploads/.gitkeep
 !data/screenshots/.gitkeep
 !data/sample-*.csv

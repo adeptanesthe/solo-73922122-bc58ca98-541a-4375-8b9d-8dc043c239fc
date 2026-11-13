@@ -115,3 +115,47 @@ class TestStateMachine:
         counts = db.row_counts(conn, bid)
         assert counts[db.SAVED] == 1
         assert counts[db.PENDING] == 1
+
+
+class TestAtomicBatchInsert:
+    def _rows(self, n=3):
+        from reporter.csvkit import CsvRow
+        return [CsvRow(i + 1, f"S{i}", "pH", f"{i}.5") for i in range(n)]
+
+    def test_batch_and_rows_inserted_in_one_commit(self, conn):
+        bid = db.create_batch_with_rows(conn, "f.csv", self._rows())
+        assert db.get_batch(conn, bid) is not None
+        rows = db.get_rows(conn, bid)
+        assert len(rows) == 3
+        assert all(r["status"] == db.PENDING for r in rows)
+
+    def test_failure_rolls_back_no_batch_left(self, conn):
+        from reporter import db as dbmod
+
+        class FailingConn:
+            """在 executemany 上抛锁错误，其余方法委托真实连接。"""
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, *a, **k):
+                return self._real.execute(*a, **k)
+
+            def executemany(self, *a, **k):
+                raise sqlite3.OperationalError("database is locked")
+
+            def commit(self):
+                return self._real.commit()
+
+            def rollback(self):
+                return self._real.rollback()
+
+        before = conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+        with pytest.raises(dbmod.LockTimeout):
+            db.create_batch_with_rows(FailingConn(conn), "f.csv", self._rows())
+        after = conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+        # 整体回滚：没有留下批次，也没有残留行
+        assert after == before
+        assert conn.execute("SELECT COUNT(*) FROM rows").fetchone()[0] == 0
+        # 回滚后连接仍可正常使用（事务已干净结束）
+        bid = db.create_batch(conn, "g.csv")
+        assert db.get_batch(conn, bid) is not None

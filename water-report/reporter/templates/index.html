@@ -3,10 +3,42 @@
 <h2>上传 CSV 新建报送批次</h2>
 <p class="muted">CSV 必须包含三列表头：<code>样本号</code>、<code>项目</code>、<code>结果</code>；
 结果为非负十进制数；（样本号, 项目）为业务键，文件内不得重复。</p>
+<p class="muted">上传容量：执行名额 <b id="gate-active">{{ gate.active }}/{{ gate.max_active }}</b>，
+排队名额 <b id="gate-queued">{{ gate.queued }}/{{ gate.max_queued }}</b>
+（总容量 {{ gate.capacity }}，满额返回可重试 503）。
+写锁等待保留 SQLite 原 30 秒忙等，等待期间本页与进度页、停止操作均不阻塞。</p>
 <form method="post" action="/batches" enctype="multipart/form-data">
   <input type="file" name="file" accept=".csv" required>
   <button type="submit">上传并建批</button>
 </form>
+
+<details style="margin:18px 0">
+  <summary class="muted" style="cursor:pointer">并发/锁等待可控演示面板（演练用）</summary>
+  <div class="flash info" style="margin-top:10px">
+    <div>1) 点"持有写锁 N 秒"制造持锁窗口；2) 窗口内并发上传多份 CSV，
+      前 {{ gate.max_active }} 份进入执行并忙等锁、其余排队，超出总容量立即 503；
+      3) 点"取消全部排队请求"，排队请求返回 503 且<b>不登记批次</b>，
+      已开始执行的请求不受影响、锁释放后照常建批。</div>
+    <div style="margin-top:10px">
+      <form method="post" action="/__demo/hold-lock" style="display:inline"
+            onsubmit="return demoPost(this)">
+        <input type="hidden" name="seconds" value="8">
+        <button type="submit" class="gray">持有写锁 8 秒</button>
+      </form>
+      <form method="post" action="/__demo/hold-lock" style="display:inline"
+            onsubmit="return demoPost(this)">
+        <input type="hidden" name="seconds" value="35">
+        <button type="submit" class="gray">持有写锁 35 秒（超过 30 秒忙等 → 503）</button>
+      </form>
+      <form method="post" action="/__demo/cancel-queued" style="display:inline"
+            onsubmit="return demoPost(this)">
+        <button type="submit" class="red">取消全部排队请求</button>
+      </form>
+      <button type="button" class="gray" onclick="refreshDemo()">刷新状态</button>
+    </div>
+    <pre id="demo-state" style="margin:10px 0 0;white-space:pre-wrap"></pre>
+  </div>
+</details>
 
 <h2 style="margin-top:34px">报送批次</h2>
 {% if busy %}
@@ -41,4 +73,28 @@
 旧报送站（演示环境，可切换"保存后断连"开关）：
 <a href="{{ legacy_url }}/" target="_blank">{{ legacy_url }}/</a>
 </p>
+<script>
+async function refreshDemo() {
+  const resp = await fetch('/__demo/stats');
+  const data = await resp.json();
+  const g = data.gate, lk = data.lock;
+  document.getElementById('gate-active').textContent = `${g.active}/${g.max_active}`;
+  document.getElementById('gate-queued').textContent = `${g.queued}/${g.max_queued}`;
+  document.getElementById('demo-state').textContent =
+    `闸门：执行 ${g.active}/${g.max_active}，排队 ${g.queued}/${g.max_queued}，` +
+    `在途 ${g.inflight}/${g.capacity}\n` +
+    `持锁：${lk.lock_held ? '是' : '否'}，剩余 ${lk.remaining_seconds}s` +
+    (lk.detail ? `（${lk.detail}）` : '');
+}
+async function demoPost(form) {
+  const body = new URLSearchParams(new FormData(form));
+  const resp = await fetch(form.action, {method: 'POST', body});
+  const data = await resp.json();
+  document.getElementById('demo-state').textContent = JSON.stringify(data, null, 2);
+  setTimeout(refreshDemo, 300);
+  return false;
+}
+setInterval(refreshDemo, 2000);
+refreshDemo();
+</script>
 {% endblock %}

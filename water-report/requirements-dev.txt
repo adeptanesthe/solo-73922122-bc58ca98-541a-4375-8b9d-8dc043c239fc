@@ -1,0 +1,4 @@
+# 测试专用依赖（运行 tests/ 下的单元/并发测试需要；运行时镜像不需要）
+-r reporter/requirements.txt
+pytest==9.2.0
+httpx==0.28.1

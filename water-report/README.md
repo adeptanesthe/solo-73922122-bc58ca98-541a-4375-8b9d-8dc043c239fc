@@ -37,6 +37,44 @@ Chromium 真实页面完成（查询页 `/search`、录入页 `/new`、保存 `/
 - 进程内 `WorkerManager` 单 worker + SQLite `worker_lock` 单行表双保险；
 - 运行中再次启动返回 HTTP 409；停止请求只在行边界生效，不打断页面事务。
 
+## 一·补、上传建批的有界并发与锁等待（不卡死页面）
+
+实验室多份 CSV 并发上传时，建批是 SQLite 写事务，遇锁会按 SQLite 原
+**30 秒 `busy_timeout`** 忙等。修复前阻塞发生在事件循环线程，持锁等待会把
+首页、原批次进度轮询和停止操作一起卡住。现在的设计：
+
+- 建批路由为 `async`，所有阻塞工作（落盘 + 数据库事务）放入**专用有界上传
+  线程池**，事件循环永不被占用——持锁期间首页、进度页、停止操作均在毫秒级响应；
+- `BoundedUploadGate` 提供**有界执行名额**（默认 4，与线程池同尺寸）和
+  **有界排队容量**（默认 16），执行 + 排队总容量 20；满额立即返回带
+  `Retry-After` 的**可重试 503**，不等待；
+- 排队请求可取消（客户端断开连接，或演示面板的"取消全部排队请求"）：
+  **尚未开始执行的请求取消后绝不建批**；
+- 已经开始的数据库操作**不可取消**：必须完成 `commit` 或 `rollback` 并关闭
+  连接后才归还执行名额，取消不会提前释放名额；
+- 建批在**单事务**内写入批次与全部行，任何失败整体回滚；30 秒忙等仍未拿到
+  写锁时返回**可重试 503 且不登记批次**，解锁后可原样重新上传；
+- 页面/停止等其余请求仍走 uvicorn/anyio 的**默认共享线程池（维持原配置）**，
+  与上传专用池隔离，因此上传拥塞不会饿死页面处理。
+
+容量与等待均可经环境变量调整：`UPLOAD_MAX_ACTIVE`、`UPLOAD_MAX_QUEUED`；
+SQLite 忙等待保持 `db.connect()` 里的 30 秒 `busy_timeout` 不变。
+
+### 可控演示（持锁 / 取消与开始执行交错）
+
+首页有"并发/锁等待可控演示面板"，也可用脚本对运行中的服务演练：
+
+```bash
+python demo_concurrency.py http://localhost:8000
+```
+
+脚本会：打开 14 秒持锁窗口 → 并发 24 份上传（4 执行忙等锁、16 排队、
+4 个满额 503）→ 持锁期间测量首页/进度/停止延迟（均 <1s）→ 窗口内取消全部
+排队（16 个快速 503 且不登记批次，4 个执行名额保留）→ 锁释放后执行中的请求
+完成建批 → 解锁后重新上传成功。也可在首页面板点"持有写锁 35 秒"观察超过
+30 秒忙等后的可重试 503。
+
+
 ## 二、目录结构
 
 ```
@@ -120,15 +158,26 @@ python3 -m venv --without-pip .venv          # 按本机环境引导 pip
 ## 七、测试
 
 ```bash
-.venv/bin/python -m pytest tests/unit_test.py -q          # 纯单元测试（14 项）
+.venv/bin/python -m pytest tests/unit_test.py -q          # 纯单元测试（含原子建批回滚）
+.venv/bin/python -m pytest tests/gate_test.py -q          # 有界闸门并发/取消/交错测试
+.venv/bin/python -m pytest tests/concurrency_test.py -q   # 真实 uvicorn 40 并发响应性实测
+# 含超过 30 秒忙等的锁超时慢用例：
+RUN_SLOW_LOCK_TEST=1 .venv/bin/python -m pytest tests/concurrency_test.py -q
 # 端到端（需先按第六节起好两个服务，驱动真实 Chromium）：
 REPORTER_URL=http://127.0.0.1:8010 LEGACY_URL=http://127.0.0.1:8011 \
-  .venv/bin/python -I tests/e2e_test.py                    # 30 项断言
+  .venv/bin/python -I tests/e2e_test.py
 ```
+
+并发实测覆盖（真实 uvicorn + httpx 并发流量）：
+
+- 总容量满额立即 503；排队取消后不登记批次，已执行者锁释放后正常建批；
+- 持锁窗口内 40 份并发上传时，首页/进度 API/停止操作最大延迟均远低于 1 秒；
+- 写锁持有超过 30 秒忙等 → 可重试 503 且批次零登记，解锁后重传成功；
+- 取消与"开始执行"交错：已取消的排队者绝不进入执行，已授名额者取消不生效。
 
 端到端覆盖：CSV 校验、先查后填、同值不重复、异值停批双方值、旧站允许重复键、
 保存后断连→待核实→续跑无重复、查询失败不入库、单实例 409、重启恢复 SAVING→待核实、
-冲突人工更正后重置再核实（共 38 项断言）。
+冲突人工更正后重置再核实。
 
 ## 八、关键环境变量
 
@@ -138,4 +187,9 @@ REPORTER_URL=http://127.0.0.1:8010 LEGACY_URL=http://127.0.0.1:8011 \
 | `HEADLESS` | `1` | 设 `0` 可观察真实浏览器操作 |
 | `SLOW_MO_MS` | `0`（compose 内 150） | 浏览器动作放慢，便于演示 |
 | `BROWSER_CHANNEL` | 空 | 本机缺 headless-shell 时设 `chromium` |
+| `UPLOAD_MAX_ACTIVE` | `4` | 上传建批执行名额（专用线程池同尺寸） |
+| `UPLOAD_MAX_QUEUED` | `16` | 上传排队名额，执行+排队满额返回可重试 503 |
 | `REPORTER_DB` / `UPLOAD_DIR` / `SCREENSHOT_DIR` | `/data/...` | 本地持久化路径 |
+
+> SQLite 写锁忙等待固定为 30 秒（`db.connect()` 的 `busy_timeout=30000`），
+> 不在环境变量中调整；超时时建批接口返回可重试 503 且不登记批次。
